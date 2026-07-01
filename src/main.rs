@@ -40,6 +40,12 @@ fn main() {
         process::exit(1);
     }
 
+    // Check if empty
+    if fs::metadata(file_path).map(|m| m.len() == 0).unwrap_or(true) {
+        eprintln!("Error: File '{}' is empty. Skipping execution.", args.file);
+        process::exit(1);
+    }
+
     // --- Create isolated temporary copy for execution ---
     let temp_dir = env::temp_dir();
     let temp_script_path = temp_dir.join(format!(
@@ -64,6 +70,7 @@ fn main() {
         process.arg(arg);
     }
 
+    // Inherit stderr to show script errors to the user
     let result = process.status();
 
     // Cleanup temp script
@@ -78,7 +85,8 @@ fn main() {
                     process::exit(1);
                 }
             } else {
-                println!("✖ FAILURE (exit code: {:?})", status.code());
+                eprintln!("✖ FAILURE (exit code: {:?})", status.code());
+                process::exit(1);
             }
         }
         Err(e) => {
