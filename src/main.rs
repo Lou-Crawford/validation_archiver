@@ -1,10 +1,9 @@
-use clap::Parser;
-use std::process::Command;
+use clap::{Parser, Subcommand};
+use std::fs;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use std::fs;
-use std::process;
+use std::process::{self, Command};
 use sha2::{Sha256, Digest};
 use nix::sys::statvfs;
 use std::os::unix::process::CommandExt;
@@ -18,61 +17,102 @@ use fs2::FileExt;
 use ignore::WalkBuilder;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "A tool to run a command with a file and archive the file on success.")]
-struct Args {
-    /// The program to execute (e.g., "python3")
-    command: String,
+#[command(version, about = "A tool to run and archive projects.")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    /// The file to archive upon success
-    file: String,
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run and archive a script or project
+    Run {
+        /// The program to execute (e.g., "python3")
+        command: String,
 
-    /// Remaining arguments to pass to the script
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    script_args: Vec<String>,
+        /// The file to archive upon success
+        file: String,
 
-    /// Require exit code 0 for success (default is relaxed: exit code 0 or empty stderr)
-    #[arg(long)]
-    strict: bool,
+        /// Remaining arguments to pass to the script
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        script_args: Vec<String>,
 
-    /// Optional folder to monitor for changes and archive
-    #[arg(long)]
-    watch: Option<PathBuf>,
+        /// Require exit code 0 for success (default is relaxed: exit code 0 or empty stderr)
+        #[arg(long)]
+        strict: bool,
+
+        /// Optional folder to monitor for changes and archive
+        #[arg(long)]
+        watch: Option<PathBuf>,
+    },
+    /// List all tracked projects
+    List,
+    /// Remove a project archive
+    Rm {
+        /// The project name to remove
+        project: String,
+    },
+    /// Prune old backups for a project
+    Prune {
+        /// The project name to prune
+        project: String,
+        /// Maximum number of backups to keep (default: 100)
+        #[arg(long, default_value_t = 100)]
+        max_backups: usize,
+    },
 }
 
 fn main() {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
+    match cli.command {
+        Commands::Run { command, file, script_args, strict, watch } => {
+            run_project(command, file, script_args, strict, watch);
+        }
+        Commands::List => {
+            list_projects();
+        }
+        Commands::Rm { project } => {
+            remove_project(&project);
+        }
+        Commands::Prune { project, max_backups } => {
+            prune_project(&project, max_backups);
+        }
+    }
+}
+
+fn run_project(cmd: String, file: String, script_args: Vec<String>, strict: bool, watch: Option<PathBuf>) {
     // --- Pre-run validation ---
-    let file_path = Path::new(&args.file);
+    let file_path = Path::new(&file);
     if !file_path.exists() {
-        eprintln!("Error: File '{}' does not exist.", args.file);
+        eprintln!("Error: File '{}' does not exist.", file);
         process::exit(1);
     }
     if fs::metadata(file_path).map(|m| !m.is_file()).unwrap_or(true) {
-        eprintln!("Error: Path '{}' is not a file.", args.file);
+        eprintln!("Error: Path '{}' is not a file.", file);
         process::exit(1);
     }
     if fs::File::open(file_path).is_err() {
-        eprintln!("Error: File '{}' is not readable.", args.file);
+        eprintln!("Error: File '{}' is not readable.", file);
         process::exit(1);
     }
 
     if fs::metadata(file_path).map(|m| m.len() == 0).unwrap_or(true) {
-        eprintln!("Error: File '{}' is empty. Skipping execution.", args.file);
+        eprintln!("Error: File '{}' is empty. Skipping execution.", file);
         process::exit(1);
     }
 
     // --- Concurrency Protection ---
-    let lock_path = format!("{}.lock", args.file);
+    let lock_path = format!("{}.lock", file);
     let lock_file = fs::File::create(&lock_path).expect("Failed to create lock file");
     if lock_file.try_lock_exclusive().is_err() {
-        eprintln!("Error: Another instance is already testing file '{}'.", args.file);
+        eprintln!("Error: Another instance is already testing file '{}'.", file);
         process::exit(1);
     }
 
     // --- Syntax Validation ---
     if !validate_script(file_path) {
-        eprintln!("Error: Script '{}' failed syntax validation.", args.file);
+        eprintln!("Error: Script '{}' failed syntax validation.", file);
         let _ = fs::remove_file(&lock_path);
         process::exit(1);
     }
@@ -105,18 +145,18 @@ fn main() {
         }
     }).expect("Error setting Ctrl-C handler");
 
-    println!("Running program: {}", args.command);
-    println!("Archivable file: {}", args.file);
-    println!("Program args: {:?}", args.script_args);
+    println!("Running program: {}", cmd);
+    println!("Archivable file: {}", file);
+    println!("Program args: {:?}", script_args);
 
-    let mut process = Command::new(&args.command);
+    let mut process = Command::new(&cmd);
     process.arg(&temp_script_path);
     process.stdout(std::process::Stdio::piped());
     process.stderr(std::process::Stdio::piped());
     // Put child in its own process group
     unsafe { process.pre_exec(|| { nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0)).map(|_| ()).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)) }); }
 
-    for arg in &args.script_args {
+    for arg in &script_args {
         process.arg(arg);
     }
 
@@ -147,11 +187,9 @@ fn main() {
                         }
                     }
                 } else {
-                    // Child died
                     break;
                 }
             } else {
-                // Should not happen if pid is correctly set
                 thread::sleep(Duration::from_secs(1));
                 continue;
             }
@@ -169,7 +207,6 @@ fn main() {
             }
             
             if idle_duration > 1800 {
-                // Send email alert
                 if let Ok(mut child) = Command::new("mail")
                     .args(["-s", "Archiver Alert: Stalled Process", "lou@samsung"])
                     .stdin(std::process::Stdio::piped())
@@ -179,7 +216,6 @@ fn main() {
                             let _ = write!(stdin, "Process has been idle for {} seconds", idle_duration);
                         }
                     }
-                // Reset warned to avoid email spam
                 warned = false;
                 last_activity = SystemTime::now();
             }
@@ -193,20 +229,20 @@ fn main() {
     let _ = fs::remove_file(&_snapshot_path);
     let _ = fs::remove_file(&lock_path);
 
-    let is_success = output.status.success() || (!args.strict && output.stderr.is_empty());
+    let is_success = output.status.success() || (!strict && output.stderr.is_empty());
 
     if is_success {
         println!("✔ SUCCESS (exit code {:?})", output.status.code());
         
         // --- Archive Logic ---
-        let files_to_archive = if let Some(watch_dir) = &args.watch {
+        let files_to_archive = if let Some(watch_dir) = &watch {
             get_monitored_files(watch_dir)
         } else {
             vec![file_path.to_path_buf()]
         };
 
         for path in files_to_archive {
-            if let Err(e) = archive_file(&path, args.watch.as_deref().unwrap_or(Path::new("single_file"))) {
+            if let Err(e) = archive_file(&path, watch.as_deref().unwrap_or(Path::new("single_file"))) {
                 eprintln!("Error archiving file {:?}: {}", path, e);
             }
         }
@@ -216,6 +252,88 @@ fn main() {
             eprintln!("Error output:\n{}", String::from_utf8_lossy(&output.stderr));
         }
         process::exit(1);
+    }
+}
+
+fn prune_project(project: &str, max_backups: usize) {
+    let home = env::var("HOME").expect("HOME not set");
+    let archive_root = format!("{}/.validation_archiver", home);
+    let project_path = Path::new(&archive_root).join(project);
+
+    if !project_path.exists() {
+        eprintln!("Error: Project '{}' not found.", project);
+        return;
+    }
+
+    // Simple recursive walk that applies rotation to all directories that contain timestamps
+    fn walk_and_prune(path: &Path, max: usize) -> std::io::Result<()> {
+        if path.is_dir() {
+            let entries: Vec<_> = fs::read_dir(path)?.filter_map(|e| e.ok()).collect();
+            // A directory is a file archive if subdirectories are numeric timestamps
+            let is_file_archive = entries.iter().all(|e| e.file_name().to_string_lossy().parse::<u64>().is_ok());
+            
+            if is_file_archive {
+                rotate_backups(path, max)?;
+            } else {
+                for entry in entries {
+                    walk_and_prune(&entry.path(), max)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    if let Err(e) = walk_and_prune(&project_path, max_backups) {
+        eprintln!("Error pruning project: {}", e);
+    } else {
+        println!("Project '{}' pruned to {} backups.", project, max_backups);
+    }
+}
+
+fn list_projects() {
+    let home = env::var("HOME").expect("HOME not set");
+    let archive_root = format!("{}/.validation_archiver", home);
+    let root_path = Path::new(&archive_root);
+
+    if !root_path.exists() {
+        println!("No projects tracked yet.");
+        return;
+    }
+
+    println!("Tracked projects and files:");
+    if let Ok(entries) = fs::read_dir(root_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name().into_string().unwrap_or_else(|_| "unknown".to_string());
+                if name == "single_file" {
+                    println!(" - [Single File Archive]");
+                } else {
+                    println!(" - [Project] {}", name);
+                }
+            }
+        }
+    }
+}
+
+fn remove_project(project: &str) {
+    let home = env::var("HOME").expect("HOME not set");
+    let archive_root = format!("{}/.validation_archiver", home);
+    let project_path = Path::new(&archive_root).join(project);
+
+    if !project_path.exists() {
+        eprintln!("Error: Project '{}' not found.", project);
+        return;
+    }
+
+    println!("Are you sure you want to remove project '{}'? [y/N]", project);
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+    if input.trim().to_lowercase() == "y" {
+        fs::remove_dir_all(&project_path).expect("Failed to remove project directory");
+        println!("Project '{}' removed.", project);
+    } else {
+        println!("Removal cancelled.");
     }
 }
 
@@ -306,9 +424,9 @@ fn rotate_backups(archive_path: &Path, max_backups: usize) -> std::io::Result<()
         .filter(|e| e.path().is_dir())
         .collect();
 
-    if entries.len() >= max_backups {
+    if entries.len() > max_backups {
         entries.sort_by_key(|e| e.metadata().unwrap().modified().unwrap());
-        for i in 0..(entries.len() - max_backups + 1) {
+        for i in 0..(entries.len() - max_backups) {
             fs::remove_dir_all(entries[i].path())?;
         }
     }
