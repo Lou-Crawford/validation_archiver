@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use procfs::process::Process;
 use fs2::FileExt;
+use ignore::WalkBuilder;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "A tool to run a command with a file and archive the file on success.")]
@@ -32,6 +33,10 @@ struct Args {
     /// Require exit code 0 for success (default is relaxed: exit code 0 or empty stderr)
     #[arg(long)]
     strict: bool,
+
+    /// Optional folder to monitor for changes and archive
+    #[arg(long)]
+    watch: Option<PathBuf>,
 }
 
 fn main() {
@@ -73,7 +78,6 @@ fn main() {
     }
 
     // --- Create isolated temporary copy for execution ---
-    // We create TWO copies for total isolation, especially for self-destructive scripts
     let temp_dir = env::temp_dir();
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     
@@ -107,6 +111,8 @@ fn main() {
 
     let mut process = Command::new(&args.command);
     process.arg(&temp_script_path);
+    process.stdout(std::process::Stdio::piped());
+    process.stderr(std::process::Stdio::piped());
     // Put child in its own process group
     unsafe { process.pre_exec(|| { nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0)).map(|_| ()).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)) }); }
 
@@ -187,17 +193,22 @@ fn main() {
     let _ = fs::remove_file(&_snapshot_path);
     let _ = fs::remove_file(&lock_path);
 
-    let is_success = if args.strict {
-        output.status.success()
-    } else {
-        output.status.success() || output.stderr.is_empty()
-    };
+    let is_success = output.status.success() || (!args.strict && output.stderr.is_empty());
 
     if is_success {
         println!("✔ SUCCESS (exit code {:?})", output.status.code());
-        if let Err(e) = archive_file(&args.file) {
-            eprintln!("Error archiving file: {}", e);
-            process::exit(1);
+        
+        // --- Archive Logic ---
+        let files_to_archive = if let Some(watch_dir) = &args.watch {
+            get_monitored_files(watch_dir)
+        } else {
+            vec![file_path.to_path_buf()]
+        };
+
+        for path in files_to_archive {
+            if let Err(e) = archive_file(&path, args.watch.as_deref().unwrap_or(Path::new("single_file"))) {
+                eprintln!("Error archiving file {:?}: {}", path, e);
+            }
         }
     } else {
         eprintln!("✖ FAILURE (exit code: {:?})", output.status.code());
@@ -218,20 +229,36 @@ fn validate_script(path: &Path) -> bool {
     }
 }
 
-fn archive_file(file_path: &str) -> std::io::Result<()> {
+fn get_monitored_files(root: &Path) -> Vec<PathBuf> {
+    WalkBuilder::new(root)
+        .add_custom_ignore_filename(".vaignore")
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            name != "__pycache__" && name != "target"
+        })
+        .build()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map_or(false, |ft| ft.is_file()))
+        .map(|e| e.path().to_path_buf())
+        .collect()
+}
+
+fn archive_file(file_path: &Path, project_root: &Path) -> std::io::Result<()> {
     let home = env::var("HOME").expect("HOME not set");
     let archive_root = format!("{}/.validation_archiver", home);
+    let project_name = project_root.file_name().unwrap().to_str().unwrap();
 
-    let path = Path::new(file_path);
-    let file_name = path.file_name().unwrap().to_str().unwrap();
+    let relative_path = file_path.strip_prefix(project_root).unwrap_or(file_path);
+    let file_name = file_path.file_name().unwrap().to_str().unwrap();
+
+    let archive_path = Path::new(&archive_root).join(project_name).join(relative_path);
 
     // --- Incremental Backup Check ---
-    let latest_hash = get_latest_hash(&archive_root, file_name);
-    let current_hash = compute_file_hash(path)?;
+    let latest_hash = get_latest_hash(&archive_path, file_name);
+    let current_hash = compute_file_hash(file_path)?;
 
     if let Some(hash) = latest_hash {
         if hash == current_hash {
-            println!("ℹ No changes detected, skipping archive.");
             return Ok(());
         }
     }
@@ -245,13 +272,16 @@ fn archive_file(file_path: &str) -> std::io::Result<()> {
         return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "Insufficient disk space"));
     }
 
+    // --- Rotation Policy ---
+    rotate_backups(&archive_path, 100)?;
+
     let start = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
-    // Structure: <archive_root>/<file_name>/<timestamp>/
-    let archive_dir = PathBuf::from(format!("{}/{}/{}", archive_root, file_name, start));
+    // Structure: <archive_root>/<project_name>/<relative_path>/<timestamp>/
+    let archive_dir = archive_path.join(start.to_string());
     fs::create_dir_all(&archive_dir)?;
 
     let destination = archive_dir.join(file_name);
@@ -268,6 +298,23 @@ fn archive_file(file_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn rotate_backups(archive_path: &Path, max_backups: usize) -> std::io::Result<()> {
+    if !archive_path.exists() { return Ok(()); }
+    
+    let mut entries: Vec<_> = fs::read_dir(archive_path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+
+    if entries.len() >= max_backups {
+        entries.sort_by_key(|e| e.metadata().unwrap().modified().unwrap());
+        for i in 0..(entries.len() - max_backups + 1) {
+            fs::remove_dir_all(entries[i].path())?;
+        }
+    }
+    Ok(())
+}
+
 fn compute_file_hash(path: &Path) -> std::io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -275,12 +322,11 @@ fn compute_file_hash(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn get_latest_hash(archive_root: &str, file_name: &str) -> Option<String> {
-    let file_dir = Path::new(archive_root).join(file_name);
-    if !file_dir.exists() { return None; }
+fn get_latest_hash(archive_path: &Path, _file_name: &str) -> Option<String> {
+    if !archive_path.exists() { return None; }
 
     // Find latest timestamp folder
-    let mut entries: Vec<_> = fs::read_dir(file_dir).ok()?.filter_map(|e| e.ok()).collect();
+    let mut entries: Vec<_> = fs::read_dir(archive_path).ok()?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.metadata().ok().map(|m| m.modified().ok()).flatten());
     let latest_dir = entries.last()?.path();
 

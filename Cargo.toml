@@ -10,3 +10,4 @@ nix = { version = "0.29", features = ["fs", "signal", "process"] }
 ctrlc = "3.4"
 procfs = "0.16"
 fs2 = "0.4"
+ignore = "0.4"
