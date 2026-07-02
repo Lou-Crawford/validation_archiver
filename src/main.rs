@@ -2,16 +2,23 @@ use clap::Parser;
 use std::process::Command;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::fs;
 use std::process;
 use sha2::{Sha256, Digest};
 use nix::sys::statvfs;
+use std::os::unix::process::CommandExt;
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use procfs::process::Process;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "A tool to run a command with a file and archive the file on success.")]
 struct Args {
-    /// The program to execute (e.g., "python")
+    /// The program to execute (e.g., "python3")
     command: String,
 
     /// The file to archive upon success
@@ -20,6 +27,10 @@ struct Args {
     /// Remaining arguments to pass to the script
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     script_args: Vec<String>,
+
+    /// Require exit code 0 for success (default is relaxed: exit code 0 or empty stderr)
+    #[arg(long)]
+    strict: bool,
 }
 
 fn main() {
@@ -40,24 +51,44 @@ fn main() {
         process::exit(1);
     }
 
-    // Check if empty
     if fs::metadata(file_path).map(|m| m.len() == 0).unwrap_or(true) {
         eprintln!("Error: File '{}' is empty. Skipping execution.", args.file);
         process::exit(1);
     }
 
-    // --- Create isolated temporary copy for execution ---
-    let temp_dir = env::temp_dir();
-    let temp_script_path = temp_dir.join(format!(
-        "validation_archiver_{}_{}",
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
-        file_path.file_name().unwrap().to_str().unwrap()
-    ));
-
-    if let Err(e) = fs::copy(file_path, &temp_script_path) {
-        eprintln!("Error creating temporary execution copy: {}", e);
+    // --- Syntax Validation ---
+    if !validate_script(file_path) {
+        eprintln!("Error: Script '{}' failed syntax validation.", args.file);
         process::exit(1);
     }
+
+    // --- Create isolated temporary copy for execution ---
+    // We create TWO copies for total isolation, especially for self-destructive scripts
+    let temp_dir = env::temp_dir();
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    
+    let temp_script_path = temp_dir.join(format!("va_exec_{}_{}", timestamp, file_path.file_name().unwrap().to_str().unwrap()));
+    let _snapshot_path = temp_dir.join(format!("va_snapshot_{}_{}", timestamp, file_path.file_name().unwrap().to_str().unwrap()));
+
+    if fs::copy(file_path, &temp_script_path).is_err() || fs::copy(file_path, &_snapshot_path).is_err() {
+        eprintln!("Error creating temporary execution copies.");
+        process::exit(1);
+    }
+
+    // --- Signal Handling & Monitoring ---
+    let child_pid = Arc::new(Mutex::new(None::<Pid>));
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    let cp = child_pid.clone();
+
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+        if let Ok(pid_guard) = cp.lock() {
+            if let Some(pid) = *pid_guard {
+                let _ = signal::kill(Pid::from_raw(-pid.as_raw()), Signal::SIGTERM);
+            }
+        }
+    }).expect("Error setting Ctrl-C handler");
 
     println!("Running program: {}", args.command);
     println!("Archivable file: {}", args.file);
@@ -65,34 +96,113 @@ fn main() {
 
     let mut process = Command::new(&args.command);
     process.arg(&temp_script_path);
+    // Put child in its own process group
+    unsafe { process.pre_exec(|| { nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0)).map(|_| ()).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)) }); }
 
     for arg in &args.script_args {
         process.arg(arg);
     }
 
-    // Inherit stderr to show script errors to the user
-    let result = process.status();
+    let mut child = process.spawn().expect("Failed to start process");
+    let c_pid = Pid::from_raw(child.id() as i32);
+    if let Ok(mut pid_guard) = child_pid.lock() {
+        *pid_guard = Some(c_pid);
+    }
 
-    // Cleanup temp script
-    let _ = fs::remove_file(&temp_script_path);
-
-    match result {
-        Ok(status) => {
-            if status.success() {
-                println!("✔ SUCCESS (exit code 0)");
-                if let Err(e) = archive_file(&args.file) {
-                    eprintln!("Error archiving file: {}", e);
-                    process::exit(1);
+    // --- Monitoring Thread ---
+    let mon_cp = child_pid.clone();
+    thread::spawn(move || {
+        let mut last_activity = SystemTime::now();
+        let mut last_cpu_time = 0;
+        let mut warned = false;
+        
+        loop {
+            thread::sleep(Duration::from_secs(5));
+            let pid = if let Ok(pid_guard) = mon_cp.lock() { *pid_guard } else { None };
+            if let Some(pid) = pid {
+                if let Ok(proc) = Process::new(pid.as_raw()) {
+                    if let Ok(stat) = proc.stat() {
+                        let current_cpu_time = stat.utime + stat.stime;
+                        if current_cpu_time != last_cpu_time {
+                            last_activity = SystemTime::now();
+                            last_cpu_time = current_cpu_time;
+                            warned = false;
+                        }
+                    }
+                } else {
+                    // Child died
+                    break;
                 }
             } else {
-                eprintln!("✖ FAILURE (exit code: {:?})", status.code());
-                process::exit(1);
+                // Should not happen if pid is correctly set
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+
+            let idle_duration = SystemTime::now().duration_since(last_activity).unwrap().as_secs();
+            
+            // 60s warning, 1800s (30m) email
+            if idle_duration > 60 && !warned {
+                if let Ok(pid_guard) = mon_cp.lock() {
+                    if let Some(pid) = *pid_guard {
+                         println!("\n[WARN] Process {} has been idle (no CPU usage) for {}s. Kill? [y/N]", pid.as_raw(), idle_duration);
+                    }
+                }
+                warned = true;
+            }
+            
+            if idle_duration > 1800 {
+                // Send email alert
+                if let Ok(mut child) = Command::new("mail")
+                    .args(["-s", "Archiver Alert: Stalled Process", "lou@samsung"])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn() {
+                        use std::io::Write;
+                        if let Some(mut stdin) = child.stdin.take() {
+                            let _ = write!(stdin, "Process has been idle for {} seconds", idle_duration);
+                        }
+                    }
+                // Reset warned to avoid email spam
+                warned = false;
+                last_activity = SystemTime::now();
             }
         }
-        Err(e) => {
-            eprintln!("Execution failed: {}", e);
+    });
+
+    let output = child.wait_with_output().expect("Failed to wait on child");
+
+    // Cleanup
+    let _ = fs::remove_file(&temp_script_path);
+    let _ = fs::remove_file(&_snapshot_path);
+
+    let is_success = if args.strict {
+        output.status.success()
+    } else {
+        output.status.success() || output.stderr.is_empty()
+    };
+
+    if is_success {
+        println!("✔ SUCCESS (exit code {:?})", output.status.code());
+        if let Err(e) = archive_file(&args.file) {
+            eprintln!("Error archiving file: {}", e);
             process::exit(1);
         }
+    } else {
+        eprintln!("✖ FAILURE (exit code: {:?})", output.status.code());
+        if !output.stderr.is_empty() {
+            eprintln!("Error output:\n{}", String::from_utf8_lossy(&output.stderr));
+        }
+        process::exit(1);
+    }
+}
+
+fn validate_script(path: &Path) -> bool {
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    match ext {
+        "py" => Command::new("python3").args(["-m", "py_compile", path.to_str().unwrap()]).status().map(|s| s.success()).unwrap_or(false),
+        "sh" | "bash" => Command::new("bash").args(["-n", path.to_str().unwrap()]).status().map(|s| s.success()).unwrap_or(false),
+        "rs" => Command::new("rustc").args(["--check", path.to_str().unwrap()]).status().map(|s| s.success()).unwrap_or(false),
+        _ => true,
     }
 }
 
