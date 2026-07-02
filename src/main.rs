@@ -19,6 +19,9 @@ use std::io::{self, Write};
 use serde::{Serialize};
 use serde_json;
 
+mod git_helpers;
+use git_helpers::{check_git_repo, check_ssh_agent, git_commit_and_push};
+
 #[derive(Parser, Debug)]
 #[command(version, about = "A tool to run and archive projects.")]
 struct Cli {
@@ -37,6 +40,10 @@ enum Commands {
         strict: bool,
         #[arg(long)]
         watch: Option<PathBuf>,
+
+        /// Automatically commit and push changes to GitHub on success
+        #[arg(long)]
+        push: bool,
     },
     List,
     Rm { project: String },
@@ -59,8 +66,8 @@ struct Metadata {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { command, file, script_args, strict, watch } => {
-            run_project(command, file, script_args, strict, watch);
+        Commands::Run { command, file, script_args, strict, watch, push } => {
+            run_project(command, file, script_args, strict, watch, push);
         }
         Commands::List => list_projects(),
         Commands::Rm { project } => remove_project(&project),
@@ -68,7 +75,7 @@ fn main() {
     }
 }
 
-fn run_project(cmd: String, file: String, script_args: Vec<String>, strict: bool, watch: Option<PathBuf>) {
+fn run_project(cmd: String, file: String, script_args: Vec<String>, strict: bool, watch: Option<PathBuf>, push: bool) {
     let file_path = Path::new(&file);
     if !file_path.exists() { eprintln!("Error: File '{}' does not exist.", file); process::exit(1); }
     if fs::metadata(file_path).map(|m| !m.is_file()).unwrap_or(true) { eprintln!("Error: Path '{}' is not a file.", file); process::exit(1); }
@@ -176,6 +183,24 @@ fn run_project(cmd: String, file: String, script_args: Vec<String>, strict: bool
         for path in files_to_archive {
             if let Err(e) = archive_file(&path, watch.as_deref().unwrap_or(Path::new("single_file")), &output, &cmd, &script_args) {
                 eprintln!("Error archiving file {:?}: {}", path, e);
+            }
+        }
+
+        if push {
+            if let Some(watch_dir) = watch {
+                if check_git_repo(&watch_dir) {
+                    if check_ssh_agent() {
+                        if let Err(e) = git_commit_and_push(&watch_dir) {
+                            eprintln!("Error during Git push: {}", e);
+                        }
+                    } else {
+                        eprintln!("Error: SSH agent not ready. Please run `ssh-add`.");
+                    }
+                } else {
+                    eprintln!("Error: Not a git repository.");
+                }
+            } else {
+                eprintln!("Error: --push requires --watch <folder>.");
             }
         }
     } else {
