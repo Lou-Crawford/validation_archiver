@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use procfs::process::Process;
+use fs2::FileExt;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "A tool to run a command with a file and archive the file on success.")]
@@ -56,9 +57,18 @@ fn main() {
         process::exit(1);
     }
 
+    // --- Concurrency Protection ---
+    let lock_path = format!("{}.lock", args.file);
+    let lock_file = fs::File::create(&lock_path).expect("Failed to create lock file");
+    if lock_file.try_lock_exclusive().is_err() {
+        eprintln!("Error: Another instance is already testing file '{}'.", args.file);
+        process::exit(1);
+    }
+
     // --- Syntax Validation ---
     if !validate_script(file_path) {
         eprintln!("Error: Script '{}' failed syntax validation.", args.file);
+        let _ = fs::remove_file(&lock_path);
         process::exit(1);
     }
 
@@ -72,6 +82,7 @@ fn main() {
 
     if fs::copy(file_path, &temp_script_path).is_err() || fs::copy(file_path, &_snapshot_path).is_err() {
         eprintln!("Error creating temporary execution copies.");
+        let _ = fs::remove_file(&lock_path);
         process::exit(1);
     }
 
@@ -174,6 +185,7 @@ fn main() {
     // Cleanup
     let _ = fs::remove_file(&temp_script_path);
     let _ = fs::remove_file(&_snapshot_path);
+    let _ = fs::remove_file(&lock_path);
 
     let is_success = if args.strict {
         output.status.success()
