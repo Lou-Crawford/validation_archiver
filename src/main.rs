@@ -3,7 +3,7 @@ use std::fs;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use std::process::{self, Command};
+use std::process::{self, Command, Output};
 use sha2::{Sha256, Digest};
 use nix::sys::statvfs;
 use std::os::unix::process::CommandExt;
@@ -16,6 +16,8 @@ use procfs::process::Process;
 use fs2::FileExt;
 use ignore::WalkBuilder;
 use std::io::{self, Write};
+use serde::{Serialize};
+use serde_json;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "A tool to run and archive projects.")]
@@ -26,41 +28,32 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Run and archive a script or project
     Run {
-        /// The program to execute (e.g., "python3")
         command: String,
-
-        /// The file to archive upon success
         file: String,
-
-        /// Remaining arguments to pass to the script
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         script_args: Vec<String>,
-
-        /// Require exit code 0 for success (default is relaxed: exit code 0 or empty stderr)
         #[arg(long)]
         strict: bool,
-
-        /// Optional folder to monitor for changes and archive
         #[arg(long)]
         watch: Option<PathBuf>,
     },
-    /// List all tracked projects
     List,
-    /// Remove a project archive
-    Rm {
-        /// The project name to remove
-        project: String,
-    },
-    /// Prune old backups for a project
+    Rm { project: String },
     Prune {
-        /// The project name to prune
         project: String,
-        /// Maximum number of backups to keep (default: 100)
         #[arg(long, default_value_t = 100)]
         max_backups: usize,
     },
+}
+
+#[derive(Serialize)]
+struct Metadata {
+    timestamp: String,
+    command: String,
+    arguments: Vec<String>,
+    working_directory: String,
+    exit_code: Option<i32>,
 }
 
 fn main() {
@@ -181,7 +174,7 @@ fn run_project(cmd: String, file: String, script_args: Vec<String>, strict: bool
         println!("✔ SUCCESS (exit code {:?})", output.status.code());
         let files_to_archive = if let Some(watch_dir) = &watch { get_monitored_files(watch_dir) } else { vec![file_path.to_path_buf()] };
         for path in files_to_archive {
-            if let Err(e) = archive_file(&path, watch.as_deref().unwrap_or(Path::new("single_file"))) {
+            if let Err(e) = archive_file(&path, watch.as_deref().unwrap_or(Path::new("single_file")), &output, &cmd, &script_args) {
                 eprintln!("Error archiving file {:?}: {}", path, e);
             }
         }
@@ -216,7 +209,7 @@ fn get_monitored_files(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-fn archive_file(file_path: &Path, project_root: &Path) -> std::io::Result<()> {
+fn archive_file(file_path: &Path, project_root: &Path, output: &process::Output, cmd: &str, args: &[String]) -> std::io::Result<()> {
     let home = env::var("HOME").expect("HOME not set");
     let archive_root = format!("{}/.validation_archiver", home);
     let project_name = project_root.file_name().unwrap().to_str().unwrap();
@@ -242,6 +235,18 @@ fn archive_file(file_path: &Path, project_root: &Path) -> std::io::Result<()> {
     fs::copy(file_path, &temp_dest)?;
     fs::rename(&temp_dest, &destination)?;
     fs::write(archive_dir.join(".hash"), current_hash)?;
+
+    let meta = Metadata {
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string(),
+        command: cmd.to_string(),
+        arguments: args.to_vec(),
+        working_directory: env::current_dir()?.display().to_string(),
+        exit_code: output.status.code(),
+    };
+    fs::write(archive_dir.join("metadata.json"), serde_json::to_string_pretty(&meta)?)?;
+    fs::write(archive_dir.join("stdout.log"), &output.stdout)?;
+    fs::write(archive_dir.join("stderr.log"), &output.stderr)?;
+
     println!("📦 Archived to {}", destination.display());
     Ok(())
 }

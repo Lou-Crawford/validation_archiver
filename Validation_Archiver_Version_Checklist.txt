@@ -1,0 +1,137 @@
+Record successful development milestones automatically
+
+Record successful development milestones automatically
+
+Problems addressed
+I forget to push changes after a successful run.
+Successful code gets overwritten and lost during development
+Intended users
+Designed my personal use
+Expand to universal use later
+Intended hardware
+Anything I program on 32 bit, 64, arm.
+Linux (ubuntu), android (termux)
+Basic architecture design
+When a user runs the setup they can enter folders or filepaths to monitor.
+When the scripts within those folders are tested, if successful a backup copy will be made using the recent change.
+Competing solutions researched
+Btrfs snapshots
+Github
+Manual backup practices
+Scope defined (but intentionally limited)
+Start with local backups for a single project
+Add github connectivity later
+Add multiple project support later
+
+V1
+IDEA - support 1 file for full local backups
+PROTOTYPE (Can I build the feature?)
+Find the source file
+Is the file readable
+Find the destination folder
+Space allocation
+Lock the file so its not edited mid copy
+Atomic saving
+Human readable file structure
+Identify the source script run successfully or fail
+On successful run trigger atomic copy
+ALPHA (Does the feature behave correctly?)
+Make an edit to the file (it should do nothing)
+Run the script using the runner (it should save it if the run passes)
+Run the script with a syntax problem using the runner (the user should see the error, and no backup should be made)
+Ensure the test script is not empty
+BETA (Does it behave correctly under bad conditions?)
+Test on a read only file
+Test on a corrupted file
+Test on a self destructive file
+Test using ctrl c during each step
+How does it handle scripts that never end
+How does it handle scripts where non 0 exits doesnt mean it failed
+What if the file is renamed?
+What if a different file is renamed to the existing file's name?
+STABLE (Has it proven itself over time?)
+How does it handle being used on a real project? (how long do we need to test it to determine it is stable?)
+
+V2
+IDEA - expand support 1 project folder
+PROTOTYPE (Can I build the feature?)
+Identify all scripts within a parent folder
+Find / make a destination folder for each script backup
+Ignore non script files
+Add user defined ignore logic
+Refactor CLI: Change the argument structure from <FILE> to <PATH> (where <PATH> can be a file or a folder).
+Ignore Pattern Support: Implement a basic .vaignore parser (compatible with gitignore patterns).
+Recursive File Discovery: Build a directory walker that identifies all non-ignored files.
+Hashing Manifest: Implement the "Pre-run manifest" -> "Run script" -> "Post-run comparison" loop for the whole folder.
+Structure & Rotation: Update archive_file to enforce the 100-copy limit and use the new namespaced directory structure.
+Recursive Scanner: Implement the get_monitored_files walker.
+Hash Manifest Refactor: Store hashes per-file in their respective archive paths (as we do now, but ensuring it handles folders).
+
+
+ALPHA (Does the feature behave correctly?)
+only related scripts and files are backed up not the whole folder
+Backup all the scripts that have changed in the folder when one is tested
+BETA (Does it behave correctly under bad conditions?)
+
+
+STABLE (Has it proven itself over time?)
+
+
+
+V3
+IDEA - support multiple projects
+PROTOTYPE (Can I build the feature?)
+Expand existing code to manage multiple file locations
+Add tool list
+Add tool remove
+Add tool run
+Add tool purge
+ALPHA (Does the feature behave correctly?)
+
+
+BETA (Does it behave correctly under bad conditions?)
+STABLE (Has it proven itself over time?)
+Verify
+
+
+V4: Reproducibility & Metadata
+IDEA - Enrich archives with actionable context for future debugging.
+PROTOTYPE:
+- Capture metadata: command, arguments, environment (env vars), working directory, timestamps.
+- Capture execution logs: stdout.log, stderr.log.
+ALPHA:
+- Verify metadata.json captures the run environment correctly.
+- Ensure stdout/stderr logs are written and linked to the specific archive.
+BETA:
+- Test reproducibility: Can a user manually re-run the archived command using the recorded metadata?
+STABLE:
+- Proven by consistent, debuggable archives across different script types.
+
+V5: GitHub Integration
+IDEA - Safely automate Git commits and pushes to remote.
+PROTOTYPE:
+- Implement `git pull --rebase` before pushing to handle remote conflicts.
+- Implement automated local `git commit` using "Auto-archive: <timestamp>" format.
+- Implement optional `git push` via CLI flag.
+ALPHA:
+- Verify commit creation on successful tests.
+- Verify push functionality with valid credentials.
+BETA:
+- Test conflict scenarios (remote changes exist).
+- Ensure Git operations don't break if the folder isn't a repo.
+STABLE:
+- Reliable automated history tracking in GitHub.
+
+V6: Extensibility (Plugin/Hook Architecture)
+IDEA - Decouple notifications and success policies from core logic.
+PROTOTYPE:
+- Implement a hook system (or config-based alerts).
+- Move `mail` notification to a hook/plugin.
+- Allow user-defined success policies (e.g., specific non-zero exit codes).
+ALPHA:
+- Verify plugin triggers on success/failure.
+- Verify custom success policies.
+BETA:
+- Test plugin isolation (do they crash the archiver?).
+STABLE:
+- Proven by community or diverse personal usage.
