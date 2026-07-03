@@ -1,16 +1,18 @@
 Record successful development milestones automatically
 
-Record successful development milestones automatically
+--- STATUS: V1, V2, V3, and V4 are COMPLETE ---
 
 Problems addressed
 I forget to push changes after a successful run.
 Successful code gets overwritten and lost during development
+
 Intended users
 Designed my personal use
 Expand to universal use later
+
 Intended hardware
-Anything I program on 32 bit, 64, arm.
 Linux (ubuntu), android (termux)
+
 Basic architecture design
 When a user runs the setup they can enter folders or filepaths to monitor.
 When the scripts within those folders are tested, if successful a backup copy will be made using the recent change.
@@ -94,11 +96,12 @@ STABLE (Has it proven itself over time?)
 Verify
 
 
-V4: Reproducibility & Metadata
+V4: Reproducibility & Metadata - [COMPLETE]
 IDEA - Enrich archives with actionable context for future debugging.
 PROTOTYPE:
 - Capture metadata: command, arguments, environment (env vars), working directory, timestamps.
 - Capture execution logs: stdout.log, stderr.log.
+- Added automated Git integration (pull, commit, push) with local safety checks (SSH agent, dirty tree detection).
 ALPHA:
 - Verify metadata.json captures the run environment correctly.
 - Ensure stdout/stderr logs are written and linked to the specific archive.
@@ -107,20 +110,17 @@ BETA:
 STABLE:
 - Proven by consistent, debuggable archives across different script types.
 
-V5: GitHub Integration
-IDEA - Safely automate Git commits and pushes to remote.
+V5: CI Integration (GitHub Actions)
+IDEA - Automate testing in clean environments using CI workflows.
 PROTOTYPE:
-- Implement `git pull --rebase` before pushing to handle remote conflicts.
-- Implement automated local `git commit` using "Auto-archive: <timestamp>" format.
-- Implement optional `git push` via CLI flag.
+- Create `.github/workflows/validate.yml`.
+- Define job to set up Python/Rust and run validation locally.
 ALPHA:
-- Verify commit creation on successful tests.
-- Verify push functionality with valid credentials.
+- Verify CI passes on push to sandbox repository.
 BETA:
-- Test conflict scenarios (remote changes exist).
-- Ensure Git operations don't break if the folder isn't a repo.
+- Test against real project environment (dependencies, environment variables).
 STABLE:
-- Reliable automated history tracking in GitHub.
+- Reliable automated testing on all pushes to GitHub.
 
 V6: Extensibility (Plugin/Hook Architecture)
 IDEA - Decouple notifications and success policies from core logic.

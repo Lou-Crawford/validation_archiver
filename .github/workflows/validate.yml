@@ -1,0 +1,42 @@
+name: Validate Project
+on: [push]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout validation_archiver tool
+        uses: actions/checkout@v4
+        with:
+          repository: Lou-Crawford/validation_archiver
+          path: validation_archiver
+
+      - name: Checkout sandbox test repo
+        uses: actions/checkout@v4
+        with:
+          path: test_repo
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          cd test_repo
+          python -m venv venv
+          source venv/bin/activate
+          pip install -r requirements.txt
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install validation_archiver
+        run: |
+          cd validation_archiver
+          cargo install --path .
+
+      - name: Run Validation
+        run: |
+          cd test_repo
+          ~/.cargo/bin/validation_archiver run venv/bin/python test.py --watch .

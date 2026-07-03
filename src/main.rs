@@ -237,7 +237,9 @@ fn get_monitored_files(root: &Path) -> Vec<PathBuf> {
 fn archive_file(file_path: &Path, project_root: &Path, output: &process::Output, cmd: &str, args: &[String]) -> std::io::Result<()> {
     let home = env::var("HOME").expect("HOME not set");
     let archive_root = format!("{}/.validation_archiver", home);
-    let project_name = project_root.file_name().unwrap().to_str().unwrap();
+    let project_name = project_root.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default_project");
     let relative_path = file_path.strip_prefix(project_root).unwrap_or(file_path);
     let file_name = file_path.file_name().unwrap().to_str().unwrap();
     let archive_path = Path::new(&archive_root).join(project_name).join(relative_path);
